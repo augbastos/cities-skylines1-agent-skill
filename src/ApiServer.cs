@@ -303,7 +303,7 @@ namespace SkylinesAgentBridge
                 return HttpResponse.Json(409, "{\"ok\":false,\"error\":\"No city is loaded.\"}");
             }
 
-            CommandResult result = bridge.Queue.RunSync(action, 10000);
+            CommandResult result = bridge.Queue.RunSyncOnSimulation(action, 30000);
             bridge.Queue.RunSync(delegate
             {
                 AgentBridgeNotifier.Notify((result.Ok ? "API OK: " : "API FAIL: ") + DescribeRequest(request));

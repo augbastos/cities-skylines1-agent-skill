@@ -11,7 +11,22 @@ namespace SkylinesAgentBridge
 
         public CommandResult RunSync(Func<CommandResult> work, int timeoutMs)
         {
-            QueuedCommand command = new QueuedCommand(work);
+            return Run(work, timeoutMs, false);
+        }
+
+        // World mutations must run on the SIMULATION thread, not the main thread the queue is
+        // pumped on. NetManager.CreateSegment -> PlayerNetAI.CreateSegment ->
+        // ManualMilestone.Unlock -> UnlockManager.CheckMilestoneImpl dispatches to the main
+        // thread, and ColossalFramework's Dispatcher throws
+        // "Already in the same thread. Call directly" when it is already there.
+        public CommandResult RunSyncOnSimulation(Func<CommandResult> work, int timeoutMs)
+        {
+            return Run(work, timeoutMs, true);
+        }
+
+        private CommandResult Run(Func<CommandResult> work, int timeoutMs, bool onSimulationThread)
+        {
+            QueuedCommand command = new QueuedCommand(work, onSimulationThread);
 
             lock (gate)
             {
@@ -63,12 +78,14 @@ namespace SkylinesAgentBridge
         private sealed class QueuedCommand
         {
             private readonly Func<CommandResult> work;
+            private readonly bool onSimulationThread;
             private readonly ManualResetEvent done = new ManualResetEvent(false);
             private CommandResult result;
 
-            public QueuedCommand(Func<CommandResult> work)
+            public QueuedCommand(Func<CommandResult> work, bool onSimulationThread)
             {
                 this.work = work;
+                this.onSimulationThread = onSimulationThread;
             }
 
             public CommandResult Result
@@ -83,13 +100,39 @@ namespace SkylinesAgentBridge
 
             public void Execute()
             {
+                // Hand off and return immediately: the HTTP thread is the one waiting on `done`,
+                // so blocking the main thread here would deadlock against the simulation thread.
+                // The queued action still runs while the game is paused.
+                if (onSimulationThread)
+                {
+                    try
+                    {
+                        ColossalFramework.Singleton<SimulationManager>.instance.AddAction(RunWork);
+                    }
+                    catch (Exception ex)
+                    {
+                        result = CommandResult.Fail("Could not queue simulation action: " +
+                            ex.GetType().Name + ": " + ex.Message);
+                        done.Set();
+                    }
+                    return;
+                }
+
+                RunWork();
+            }
+
+            private void RunWork()
+            {
                 try
                 {
                     result = work();
                 }
                 catch (Exception ex)
                 {
-                    result = CommandResult.Fail(ex.GetType().Name + ": " + ex.Message);
+                    // The stack is the whole diagnosis when the fault is inside game code rather
+                    // than in the command itself; the message alone hides the real caller.
+                    result = CommandResult.Fail(ex.GetType().Name + ": " + ex.Message +
+                        "\n" + ex.StackTrace);
                 }
                 finally
                 {
